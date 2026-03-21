@@ -7,17 +7,10 @@ const crypto = require('crypto');
 
 const WDB_MIN_SIZE = 32;
 const CHUNK_SIZE = 5 * 1024 * 1024;
+const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
-const BINARY_NAMES = {
-	'wow': 'Wow.exe',
-	'wowt': 'WowT.exe',
-	'wow_beta': 'WowB.exe',
-	'wow_classic': 'WowClassic.exe',
-	'wow_classic_era': 'WowClassic.exe',
-	'wow_classic_era_ptr': 'WowClassic.exe',
-	'wow_classic_ptr': 'WowClassic.exe',
-	'wow_classic_beta': 'WowClassic.exe'
-};
+const BINARY_EXE_PATTERN = /\.exe$/i;
+const BINARY_APP_DIR = '.app';
 
 function log(msg) {
 	parentPort.postMessage(msg);
@@ -139,7 +132,7 @@ function parse_build_info(text) {
 
 async function hash_file(file_path) {
 	return new Promise((resolve, reject) => {
-		const hash = crypto.createHash('sha256');
+		const hash = crypto.createHash('md5');
 		const stream = fs.createReadStream(file_path);
 		stream.on('data', chunk => hash.update(chunk));
 		stream.on('end', () => resolve(hash.digest('hex')));
@@ -147,25 +140,39 @@ async function hash_file(file_path) {
 	});
 }
 
-async function find_binary(flavor_dir, product) {
-	const known_name = BINARY_NAMES[product];
-	if (known_name) {
-		const bin_path = path.join(flavor_dir, known_name);
-		try {
-			await fsp.access(bin_path);
-			return bin_path;
-		} catch {}
-	}
+async function find_binaries(flavor_dir) {
+	const binaries = [];
 
-	// fallback: scan for Wow*.exe
 	try {
-		const entries = await fsp.readdir(flavor_dir);
-		const candidates = entries.filter(e => /^Wow.*\.exe$/i.test(e));
-		if (candidates.length > 0)
-			return path.join(flavor_dir, candidates[0]);
+		const entries = await fsp.readdir(flavor_dir, { withFileTypes: true });
+
+		for (const entry of entries) {
+			if (entry.isFile() && BINARY_EXE_PATTERN.test(entry.name) && entry.name.toLowerCase() !== 'blizzarderror.exe')
+				binaries.push(path.join(flavor_dir, entry.name));
+
+			if (entry.isDirectory() && entry.name.endsWith(BINARY_APP_DIR)) {
+				const app_binaries = await scan_app_bundle(path.join(flavor_dir, entry.name));
+				binaries.push(...app_binaries);
+			}
+		}
 	} catch {}
 
-	return null;
+	return binaries;
+}
+
+async function scan_app_bundle(app_dir) {
+	const binaries = [];
+	const macos_dir = path.join(app_dir, 'Contents', 'MacOS');
+
+	try {
+		const entries = await fsp.readdir(macos_dir, { withFileTypes: true });
+		for (const entry of entries) {
+			if (entry.isFile())
+				binaries.push(path.join(macos_dir, entry.name));
+		}
+	} catch {}
+
+	return binaries;
 }
 
 async function scan_wdb(flavor_dir) {
@@ -199,7 +206,7 @@ async function scan_wdb(flavor_dir) {
 			try {
 				const stat = await fsp.stat(file_path);
 				if (stat.size > WDB_MIN_SIZE)
-					wdb_files.push({ name: file, locale: locale_entry.name, size: stat.size, path: file_path });
+					wdb_files.push({ name: file, locale: locale_entry.name, size: stat.size, path: file_path, modified_at: stat.mtimeMs });
 			} catch {}
 		}
 	}
@@ -226,35 +233,74 @@ async function scan_adb(flavor_dir) {
 		try {
 			const stat = await fsp.stat(file_path);
 			if (stat.size > WDB_MIN_SIZE)
-				adb_files.push({ name: 'DBCache.bin', locale: locale_entry.name, size: stat.size, path: file_path });
+				adb_files.push({ name: 'DBCache.bin', locale: locale_entry.name, size: stat.size, path: file_path, modified_at: stat.mtimeMs });
 		} catch {}
 	}
 
 	return adb_files;
 }
 
-async function upload_flavor(result) {
+async function load_state(state_path) {
+	try {
+		const data = await fsp.readFile(state_path, 'utf8');
+		return JSON.parse(data);
+	} catch {
+		return {};
+	}
+}
+
+async function save_state(state_path, state) {
+	await fsp.writeFile(state_path, JSON.stringify(state), 'utf8');
+}
+
+async function upload_flavor(result, state) {
 	const { machine_id, submit_url, finalize_url, user_agent } = workerData;
 
 	if (!result.cache_files || result.cache_files.length === 0)
 		return;
 
+	const flavor_key = `${result.product}|${result.patch}|${result.build_number}`;
+	const prev_hashes = state[flavor_key] || {};
+
 	const file_buffers = new Map();
+	const file_hashes = new Map();
 	const submit_files = [];
+
+	const now = Date.now();
 
 	for (const wdb of result.cache_files) {
 		try {
+			if (now - wdb.modified_at > MAX_AGE_MS) {
+				log(`skipping ${wdb.name} (${wdb.locale}): file too old`);
+				continue;
+			}
+
 			const buffer = await fsp.readFile(wdb.path);
+
+			if (buffer.length === 0) {
+				log(`skipping ${wdb.name} (${wdb.locale}): empty file`);
+				continue;
+			}
+
 			const key = `${wdb.locale}/${wdb.name}`;
+			const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+
+			file_hashes.set(key, hash);
+
+			if (prev_hashes[key] === hash)
+				continue;
+
 			file_buffers.set(key, buffer);
-			submit_files.push({ name: wdb.name, locale: wdb.locale, size: buffer.length });
+			submit_files.push({ name: wdb.name, locale: wdb.locale, size: buffer.length, modified_at: new Date(wdb.modified_at).toISOString() });
 		} catch (e) {
 			log(`failed to read ${wdb.path}: ${e.message}`);
 		}
 	}
 
-	if (submit_files.length === 0)
+	if (submit_files.length === 0) {
+		log(`all files unchanged for ${result.product}, skipping`);
 		return;
+	}
 
 	const submit_res = await json_post(submit_url, {
 		machine_id,
@@ -263,7 +309,7 @@ async function upload_flavor(result) {
 		build_number: parseInt(result.build_number) || 0,
 		build_key: result.build_key,
 		cdn_key: result.cdn_key,
-		binary_hash: result.binary_hash || '',
+		binary_hashes: result.binary_hashes || {},
 		files: submit_files
 	}, user_agent);
 
@@ -286,7 +332,7 @@ async function upload_flavor(result) {
 
 		try {
 			await upload_chunks(url, buffer);
-			checksums[key] = crypto.createHash('sha256').update(buffer).digest('hex');
+			checksums[key] = file_hashes.get(key);
 		} catch (e) {
 			log(`upload failed for ${key}: ${e.message}`);
 		}
@@ -294,14 +340,23 @@ async function upload_flavor(result) {
 
 	const finalize_res = await json_post(finalize_url, { submission_id, checksums }, user_agent);
 
-	if (finalize_res.ok)
+	if (finalize_res.ok) {
 		log(`submission ${submission_id} finalized`);
-	else
+
+		// update state with hashes of successfully uploaded files
+		const new_hashes = { ...prev_hashes };
+		for (const key of Object.keys(checksums))
+			new_hashes[key] = checksums[key];
+
+		state[flavor_key] = new_hashes;
+	} else {
 		log(`finalize failed (${finalize_res.status}) for ${submission_id}`);
+	}
 }
 
 async function collect() {
-	const { install_path } = workerData;
+	const { install_path, state_path } = workerData;
+	const state = await load_state(state_path);
 
 	const build_info_path = path.join(install_path, '.build.info');
 	const build_info_text = await fsp.readFile(build_info_path, 'utf8');
@@ -335,11 +390,11 @@ async function collect() {
 
 		const flavor_path = path.join(install_path, flavor.dir);
 
-		const binary_path = await find_binary(flavor_path, flavor.product);
-		let binary_hash = null;
-		if (binary_path) {
+		const binary_paths = await find_binaries(flavor_path);
+		const binary_hashes = {};
+		for (const bin_path of binary_paths) {
 			try {
-				binary_hash = await hash_file(binary_path);
+				binary_hashes[path.basename(bin_path)] = await hash_file(bin_path);
 			} catch {}
 		}
 
@@ -362,13 +417,15 @@ async function collect() {
 				build_number,
 				build_key: build_row['Build Key'] || '',
 				cdn_key: build_row['CDN Key'] || '',
-				binary_hash,
+				binary_hashes,
 				cache_files
-			});
+			}, state);
 		} catch (e) {
 			log(`error for ${flavor.product}: ${e.message}`);
 		}
 	}
+
+	await save_state(state_path, state);
 }
 
 collect().catch(err => log(`fatal: ${err.message}`));
