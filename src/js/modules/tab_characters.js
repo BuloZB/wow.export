@@ -117,6 +117,7 @@ const equipment_model_renderers = new Map();
 const collection_model_renderers = new Map();
 
 let current_char_component_texture_layout_id = 0;
+let default_model_file_data_id = 0;
 let watcher_cleanup_funcs = [];
 let is_importing = false;
 
@@ -276,6 +277,10 @@ async function refresh_character_appearance(core) {
 	if (!active_renderer || is_importing)
 		return;
 
+	// check if a conditional model swap is needed (e.g. upright orc)
+	if (await check_cond_model_swap(core))
+		return;
+
 	log.write('Refreshing character appearance...');
 
 	update_geosets(core);
@@ -283,6 +288,27 @@ async function refresh_character_appearance(core) {
 	await update_equipment_models(core);
 
 	log.write('Character appearance refresh complete');
+}
+
+async function check_cond_model_swap(core) {
+	const active_choices = core.view.chrCustActiveChoices;
+	let target_file_data_id = default_model_file_data_id;
+
+	for (const choice of active_choices) {
+		const cond_file_data_id = DBCharacterCustomization.get_choice_cond_model_file_data_id(choice.choiceID);
+		if (cond_file_data_id !== undefined) {
+			target_file_data_id = cond_file_data_id;
+			break;
+		}
+	}
+
+	if (!target_file_data_id || target_file_data_id === active_model)
+		return false;
+
+	log.write('Conditional model swap: %d -> %d', active_model, target_file_data_id);
+	active_model = undefined;
+	await load_character_model(core, target_file_data_id);
+	return true;
 }
 
 /**
@@ -302,9 +328,10 @@ function update_geosets(core) {
 
 	// step 3: apply equipment geosets (overrides customization where applicable)
 	const equipped_items = core.view.chrEquippedItems;
+	const item_skins = core.view.chrEquippedItemSkins;
 	if (equipped_items && Object.keys(equipped_items).length > 0) {
-		const equipment_geosets = DBItemGeosets.calculateEquipmentGeosets(equipped_items);
-		const affected_groups = DBItemGeosets.getAffectedCharGeosets(equipped_items);
+		const equipment_geosets = DBItemGeosets.calculateEquipmentGeosets(equipped_items, item_skins);
+		const affected_groups = DBItemGeosets.getAffectedCharGeosets(equipped_items, item_skins);
 
 		for (const char_geoset of affected_groups) {
 			const base = char_geoset * 100;
@@ -333,7 +360,8 @@ function update_geosets(core) {
 		if (head_item) {
 			const char_info = get_current_race_gender(core);
 			if (char_info) {
-				const hide_groups = DBItemGeosets.getHelmetHideGeosets(head_item, char_info.raceID, char_info.genderIndex);
+				const head_modifier = item_skins?.[1];
+				const hide_groups = DBItemGeosets.getHelmetHideGeosets(head_item, char_info.raceID, char_info.genderIndex, head_modifier);
 				for (const char_geoset of hide_groups) {
 					const base = char_geoset * 100;
 					const range_start = base + 1;
@@ -371,6 +399,7 @@ async function update_textures(core) {
 
 	// step 4: apply equipment textures
 	const equipped_items = core.view.chrEquippedItems;
+	const item_skins = core.view.chrEquippedItemSkins;
 	if (equipped_items && Object.keys(equipped_items).length > 0) {
 		const char_info = get_current_race_gender(core);
 		const sections = DBCharacterCustomization.get_texture_sections(current_char_component_texture_layout_id);
@@ -419,7 +448,8 @@ async function update_textures(core) {
 				if (DBGuildTabard.isGuildTabard(item_id))
 					continue;
 
-				const item_textures = DBItemCharTextures.getItemTextures(item_id, char_info?.raceID, char_info?.genderIndex);
+				const modifier_id = item_skins?.[slot_id];
+				const item_textures = DBItemCharTextures.getItemTextures(item_id, char_info?.raceID, char_info?.genderIndex, modifier_id);
 				if (!item_textures)
 					continue;
 
@@ -532,6 +562,7 @@ async function update_equipment_models(core) {
 		return;
 
 	const equipped_items = core.view.chrEquippedItems;
+	const item_skins = core.view.chrEquippedItemSkins;
 	const current_slots = new Set(Object.keys(equipped_items).map(Number));
 
 	// dispose attachment models for slots no longer equipped
@@ -562,10 +593,12 @@ async function update_equipment_models(core) {
 	for (const [slot_id_str, item_id] of Object.entries(equipped_items)) {
 		const slot_id = Number(slot_id_str);
 
-		// check if we already have renderers for this slot with same item
+		// check if we already have renderers for this slot with same item + skin
+		const modifier_id = item_skins?.[slot_id_str];
 		const existing_equipment = equipment_model_renderers.get(slot_id);
 		const existing_collection = collection_model_renderers.get(slot_id);
-		if ((existing_equipment?.item_id === item_id) && (existing_collection?.item_id === item_id || !existing_collection))
+		if ((existing_equipment?.item_id === item_id && existing_equipment?.modifier_id === modifier_id) &&
+			(existing_collection?.item_id === item_id && existing_collection?.modifier_id === modifier_id || !existing_collection))
 			continue;
 
 		// dispose old renderers if item changed
@@ -587,7 +620,7 @@ async function update_equipment_models(core) {
 		const char_info = get_current_race_gender(core);
 
 		// get display data for this item (models and textures, filtered by race/gender)
-		const display = DBItemModels.getItemDisplay(item_id, char_info?.raceID, char_info?.genderIndex);
+		const display = DBItemModels.getItemDisplay(item_id, char_info?.raceID, char_info?.genderIndex, modifier_id);
 		if (!display || !display.models || display.models.length === 0)
 			continue;
 
@@ -618,8 +651,8 @@ async function update_equipment_models(core) {
 					const is_collection_style = false;
 
 					// apply textures
-					if (display.textures && display.textures.length > i)
-						await renderer.applyReplaceableTextures({ textures: [display.textures[i]] });
+					if (display.textures)
+						await renderer.applyReplaceableTextures({ textures: display.textures });
 
 					renderers.push({ renderer, attachment_id, is_collection_style });
 					log.write('Loaded attachment model %d for slot %d attachment %d (item %d)', file_data_id, slot_id, attachment_id, item_id);
@@ -629,7 +662,7 @@ async function update_equipment_models(core) {
 			}
 
 			if (renderers.length > 0)
-				equipment_model_renderers.set(slot_id, { renderers, item_id });
+				equipment_model_renderers.set(slot_id, { renderers, item_id, modifier_id });
 		}
 
 		// load collection models (models beyond attachment count, or all models if no attachments)
@@ -661,11 +694,8 @@ async function update_equipment_models(core) {
 					}
 
 					// use matching texture for this model index
-					const texture_idx = i < display.textures?.length ? i : 0;
-					const texture_fdid = display.textures?.[texture_idx];
-
-					if (texture_fdid)
-						await renderer.applyReplaceableTextures({ textures: [texture_fdid] });
+					if (display.textures)
+						await renderer.applyReplaceableTextures({ textures: display.textures });
 
 					renderers.push(renderer);
 					log.write('Loaded collection model %d for slot %d (item %d)', file_data_id, slot_id, item_id);
@@ -675,7 +705,7 @@ async function update_equipment_models(core) {
 			}
 
 			if (renderers.length > 0)
-				collection_model_renderers.set(slot_id, { renderers, item_id });
+				collection_model_renderers.set(slot_id, { renderers, item_id, modifier_id });
 		}
 	}
 }
@@ -882,6 +912,7 @@ async function update_model_selection(core) {
 
 	// load the model (this will call refresh_character_appearance when done)
 	const file_data_id = DBCharacterCustomization.get_model_file_data_id(selected.id);
+	default_model_file_data_id = file_data_id;
 	await load_character_model(core, file_data_id);
 }
 
@@ -1048,7 +1079,7 @@ async function import_wowhead_character(core) {
  * Sets all state first, then triggers model selection which loads the model.
  */
 async function apply_import_data(core, data, source) {
-	let race_id, gender_index, customizations, equipment;
+	let race_id, gender_index, customizations, equipment, equipment_skins = {};
 
 	if (source === 'bnet') {
 		race_id = data.playable_race.id;
@@ -1070,6 +1101,14 @@ async function apply_import_data(core, data, source) {
 
 		gender_index = data.gender.type === 'MALE' ? 0 : 1;
 
+		// fallback: if resolved model has no customization data, try Race_related
+		const test_model_id = DBCharacterCustomization.get_chr_model_id(race_id, gender_index);
+		if (test_model_id === undefined || !DBCharacterCustomization.get_options_for_model(test_model_id)) {
+			const chr_race_row = await db2.ChrRaces.getRow(race_id);
+			if (chr_race_row?.Race_related)
+				race_id = chr_race_row.Race_related;
+		}
+
 		const chr_model_id = DBCharacterCustomization.get_chr_model_id(race_id, gender_index);
 		const available_options = DBCharacterCustomization.get_options_for_model(chr_model_id);
 		const available_options_ids = available_options.map(opt => opt.id);
@@ -1085,7 +1124,21 @@ async function apply_import_data(core, data, source) {
 			for (const item of data.items) {
 				const slot_id = item.internal_slot_id + 1;
 				equipment[slot_id] = item.id;
+
+				if (item.item_appearance_modifier_id)
+					equipment_skins[slot_id] = item.item_appearance_modifier_id;
 			}
+		}
+
+		if (data.guild_crest) {
+			const crest = data.guild_crest;
+			core.view.chrGuildTabardConfig = {
+				background: crest.background?.color?.id ?? 0,
+				border_style: crest.border?.id ?? 0,
+				border_color: crest.border?.color?.id ?? 0,
+				emblem_design: crest.emblem?.id ?? 0,
+				emblem_color: crest.emblem?.color?.id ?? 0
+			};
 		}
 
 	} else if (source === 'wmv') {
@@ -1157,6 +1210,7 @@ async function apply_import_data(core, data, source) {
 
 	try {
 		core.view.chrEquippedItems = { ...equipment };
+		core.view.chrEquippedItemSkins = { ...equipment_skins };
 
 		core.view.chrImportChoices.splice(0, core.view.chrImportChoices.length);
 		core.view.chrImportChoices.push(...customizations);
@@ -1251,6 +1305,10 @@ async function save_character(core, name, thumb_data) {
 		guild_tabard: { ...core.view.chrGuildTabardConfig }
 	};
 
+	const skins = core.view.chrEquippedItemSkins;
+	if (skins && Object.keys(skins).length > 0)
+		data.equipment_skins = { ...skins };
+
 	const json_path = path.join(dir, `${name}-${id}.json`);
 	await fsp.writeFile(json_path, JSON.stringify(data, null, '\t'));
 
@@ -1303,6 +1361,7 @@ async function load_character(core, character) {
 
 		// apply equipment
 		core.view.chrEquippedItems = data.equipment || {};
+		core.view.chrEquippedItemSkins = data.equipment_skins || {};
 
 		// apply guild tabard config
 		if (data.guild_tabard)
@@ -1421,13 +1480,19 @@ async function capture_character_thumbnail(core) {
 }
 
 function get_current_character_data(core) {
-	return {
+	const data = {
 		race_id: core.view.chrCustRaceSelection[0]?.id,
 		model_id: core.view.chrCustModelSelection[0]?.id,
 		choices: [...core.view.chrCustActiveChoices],
 		equipment: { ...core.view.chrEquippedItems },
 		guild_tabard: { ...core.view.chrGuildTabardConfig }
 	};
+
+	const skins = core.view.chrEquippedItemSkins;
+	if (skins && Object.keys(skins).length > 0)
+		data.equipment_skins = { ...skins };
+
+	return data;
 }
 
 async function export_json_character(core) {
@@ -1546,8 +1611,11 @@ async function import_json_character(core, save_to_my_characters) {
 					race_id: data.race_id,
 					model_id: data.model_id,
 					choices: data.choices || [],
-					equipment: data.equipment || {}
+					equipment: data.equipment || {},
 				};
+
+				if (data.equipment_skins && Object.keys(data.equipment_skins).length > 0)
+					save_data.equipment_skins = data.equipment_skins;
 
 				const save_path = path.join(dir, `${name}-${id}.json`);
 				await fsp.writeFile(save_path, JSON.stringify(save_data, null, '\t'));
@@ -1568,6 +1636,7 @@ async function import_json_character(core, save_to_my_characters) {
 				core.view.chrSavedCharactersScreen = false;
 
 				core.view.chrEquippedItems = data.equipment || {};
+				core.view.chrEquippedItemSkins = data.equipment_skins || {};
 
 				core.view.chrImportChoices.splice(0, core.view.chrImportChoices.length);
 				core.view.chrImportChoices.push(...(data.choices || []));
@@ -1734,7 +1803,7 @@ const export_char_model = async (core) => {
 
 				for (const geom of char_exporter.get_equipment_geometry(apply_pose)) {
 					// get textures from display info
-					const display = DBItemModels.getItemDisplay(geom.item_id, char_info?.raceID, char_info?.genderIndex);
+					const display = DBItemModels.getItemDisplay(geom.item_id, char_info?.raceID, char_info?.genderIndex, geom.modifier_id);
 					const textures = display?.textures || [];
 
 					equipment_data.push({
@@ -1790,7 +1859,7 @@ const export_char_model = async (core) => {
 
 				// for GLTF, don't apply pose - let the armature handle it
 				for (const geom of char_exporter.get_equipment_geometry(false)) {
-					const display = DBItemModels.getItemDisplay(geom.item_id, char_info?.raceID, char_info?.genderIndex);
+					const display = DBItemModels.getItemDisplay(geom.item_id, char_info?.raceID, char_info?.genderIndex, geom.modifier_id);
 					const textures = display?.textures || [];
 
 					equipment_data.push({
@@ -2191,10 +2260,16 @@ module.exports = {
 						<span class="slot-label">{{ slot.name }}:</span>
 						<span v-if="get_equipped_item(slot.id)" :class="'slot-item item-quality-' + get_equipped_item(slot.id).quality" :title="get_equipped_item(slot.id).name + ' (' + get_equipped_item(slot.id).id + ')'">{{ get_equipped_item(slot.id).name }}</span>
 						<span v-else class="slot-empty">Empty</span>
+						<span v-if="get_item_skin_count(slot.id) > 1" class="slot-skin-controls" @click.stop>
+							<span class="slot-skin-arrow" @click="cycle_item_skin(slot.id, -1)">&lt;</span>
+							<span class="slot-skin-label">{{ get_item_skin_index(slot.id) + 1 }}/{{ get_item_skin_count(slot.id) }}</span>
+							<span class="slot-skin-arrow" @click="cycle_item_skin(slot.id, 1)">&gt;</span>
+						</span>
 					</div>
 					<component :is="$components.ContextMenu" :node="$core.view.chrEquipmentSlotContext" v-slot:default="context" @close="$core.view.chrEquipmentSlotContext = null">
 						<span @click.self="replace_slot_item(context.node)">Replace Item</span>
 						<span @click.self="unequip_slot(context.node)">Remove Item</span>
+						<span v-if="get_item_skin_count(context.node) > 1" @click.self="cycle_item_skin(context.node, 1)">Next Skin ({{ get_item_skin_index(context.node) + 1 }}/{{ get_item_skin_count(context.node) }})</span>
 						<span @click.self="copy_item_id(context.node)">Copy Item ID ({{ get_equipped_item(context.node)?.id }})</span>
 						<span @click.self="copy_item_name(context.node)">Copy Item Name</span>
 					</component>
@@ -2415,7 +2490,9 @@ module.exports = {
 
 		unequip_slot(slot_id) {
 			delete this.$core.view.chrEquippedItems[slot_id];
+			delete this.$core.view.chrEquippedItemSkins[slot_id];
 			this.$core.view.chrEquippedItems = { ...this.$core.view.chrEquippedItems };
+			this.$core.view.chrEquippedItemSkins = { ...this.$core.view.chrEquippedItemSkins };
 		},
 
 		replace_slot_item(slot_id) {
@@ -2441,6 +2518,49 @@ module.exports = {
 
 		clear_all_equipment() {
 			this.$core.view.chrEquippedItems = {};
+			this.$core.view.chrEquippedItemSkins = {};
+		},
+
+		get_item_skin_count(slot_id) {
+			const item_id = this.$core.view.chrEquippedItems[slot_id];
+			if (!item_id)
+				return 0;
+
+			return DBItemModels.getItemModifiers(item_id).length;
+		},
+
+		get_item_skin_index(slot_id) {
+			const item_id = this.$core.view.chrEquippedItems[slot_id];
+			if (!item_id)
+				return 0;
+
+			const modifiers = DBItemModels.getItemModifiers(item_id);
+			const current = this.$core.view.chrEquippedItemSkins[slot_id];
+
+			if (current === undefined)
+				return 0;
+
+			const idx = modifiers.indexOf(current);
+			return idx >= 0 ? idx : 0;
+		},
+
+		cycle_item_skin(slot_id, delta) {
+			const item_id = this.$core.view.chrEquippedItems[slot_id];
+			if (!item_id)
+				return;
+
+			const modifiers = DBItemModels.getItemModifiers(item_id);
+			if (modifiers.length <= 1)
+				return;
+
+			const current = this.$core.view.chrEquippedItemSkins[slot_id];
+			let idx = current !== undefined ? modifiers.indexOf(current) : 0;
+			if (idx < 0)
+				idx = 0;
+
+			idx = (idx + delta + modifiers.length) % modifiers.length;
+			this.$core.view.chrEquippedItemSkins[slot_id] = modifiers[idx];
+			this.$core.view.chrEquippedItemSkins = { ...this.$core.view.chrEquippedItemSkins };
 		},
 
 		is_guild_tabard_equipped() {
@@ -2625,6 +2745,7 @@ module.exports = {
 			this.$core.view.$watch('chrCustChoiceSelection', () => update_customization_choice(this.$core), { deep: true }),
 			this.$core.view.$watch('chrCustActiveChoices', () => refresh_character_appearance(this.$core), { deep: true }),
 			this.$core.view.$watch('chrEquippedItems', () => refresh_character_appearance(this.$core), { deep: true }),
+			this.$core.view.$watch('chrEquippedItemSkins', () => refresh_character_appearance(this.$core), { deep: true }),
 			this.$core.view.$watch('chrGuildTabardConfig', () => refresh_character_appearance(this.$core), { deep: true }),
 			this.$core.view.$watch('chrModelViewerAnimSelection', async selected_animation_id => {
 				if (!active_renderer || !active_renderer.playAnimation || this.$core.view.chrModelViewerAnims.length === 0)

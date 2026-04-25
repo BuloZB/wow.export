@@ -261,7 +261,8 @@ const makeNewView = () => {
 		chrImportChoices: [], // Temporary storage for character import choices.
 		chrImportWowheadURL: '', // Wowhead dressing room url
 		characterImportMode: 'none', // Controls visibility of character import interface ('none', 'BNET', 'WHEAD')
-		chrEquippedItems: {}, // Equipped items by slot name (e.g., { Head: item, Chest: item })
+		chrEquippedItems: {}, // Equipped items by slot id (e.g., { 1: item_id, 5: item_id })
+		chrEquippedItemSkins: {}, // Item skin selection by slot id (e.g., { 1: modifier_id })
 		chrGuildTabardConfig: { background: 0, border_style: 0, border_color: 0, emblem_design: 0, emblem_color: 0 },
 		chrEquipmentSlotContext: null, // Context menu node for equipment slot right-click
 		chrSavedCharactersScreen: false, // Controls visibility of saved characters screen
@@ -388,6 +389,18 @@ const view = null;
  * @returns FileWriter|null
  */
 const openLastExportStream = () => {
+	try {
+		const stat = fs.statSync(constants.LAST_EXPORT);
+		if (stat.isDirectory()) {
+			log.write('last_export path is a directory, removing it');
+			fs.rmSync(constants.LAST_EXPORT, { recursive: true });
+		}
+	} catch (e) {
+		// ENOENT is expected if the file doesn't exist yet
+		if (e.code !== 'ENOENT')
+			log.write('failed to stat last_export: %s', e.message);
+	}
+
 	return new FileWriter(constants.LAST_EXPORT, 'utf8');
 };
 
