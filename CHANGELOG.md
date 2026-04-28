@@ -1,4 +1,8 @@
-## 0.2.15 (25-04-2026)
+## 0.2.16 (xx-0x-2026)
+- Fixed crash when loading Dracthyr characters (thanks Natnat).
+
+## 0.2.15 (26-04-2026)
+- Added ability to equip left and right shoulderpads independently.
 - Added support for item variants in character customization.
 - Added support for conditional character models (such as upright orcs).
 - Added working builds for macOS Apple Silicon (ARM64). (3)
@@ -6,10 +10,12 @@
 - Added 'Apply Pose' checkbox to export models in their animated pose as OBJ/STL.
 - Importing from Battle.net now uses the correct item appearance in character customization.
 - Importing from Battle.net now loads your character's guild tabard customization.
+- Improved item equipping in character customization to be quicker and easier.
 - Improved 3D previews for WMO models.
 - Improved 3D preview rendering with animated texture effects, submesh colors, and looping visual effects. (1)
 - Improved rendering order of transparent and layered model parts in the 3D previewer. (1)
 - Improved blend mode rendering for glowing and transparent model effects. (1)
+- Improved output of newer WMO models when exporting directly as OBJ.
 - Fixed issues that would prevent wow.export from functioning correctly on macOS. (2)
 - Fixed 3D preview failing on macOS due to shader uniform limit. (2)
 - Fixed crash when copying item IDs in character tab.
