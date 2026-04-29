@@ -1,4 +1,5 @@
-## 0.2.16 (xx-0x-2026)
+## 0.2.15 Hotfixes
+- Fixed a regression causing terrain UV maps to be broken.
 - Fixed crash when loading Dracthyr characters (thanks Natnat).
 
 ## 0.2.15 (26-04-2026)
