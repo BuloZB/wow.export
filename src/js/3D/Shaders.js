@@ -15,7 +15,16 @@ const SHADER_MANIFEST = {
 	wmo: { vert: 'wmo.vertex.shader', frag: 'wmo.fragment.shader' },
 	adt: { vert: 'adt.vertex.shader', frag: 'adt.fragment.shader' },
 	adt_old: { vert: 'adt.vertex.shader', frag: 'adt.fragment.old.shader' },
-	char: { vert: 'char.vertex.shader', frag: 'char.fragment.shader' }
+	char: { vert: 'char.vertex.shader', frag: 'char.fragment.shader' },
+	mpv_terrain: { vert: 'mpv_terrain.vertex.shader', frag: 'mpv_terrain.fragment.shader' },
+	mpv_terrain_wire: { vert: 'mpv_terrain.vertex.shader', frag: 'mpv_terrain_wire.fragment.shader' },
+	mpv_terrain_minimap: { vert: 'mpv_terrain_tex.vertex.shader', frag: 'mpv_terrain_minimap.fragment.shader' },
+	mpv_terrain_full: { vert: 'mpv_terrain_full.vertex.shader', frag: 'mpv_terrain_full.fragment.shader' },
+	mpv_terrain_full_legacy: { vert: 'mpv_terrain_full.vertex.shader', frag: 'mpv_terrain_full_legacy.fragment.shader' },
+	mpv_m2: { vert: 'mpv_m2.vertex.shader', frag: 'mpv_m2.fragment.shader' },
+	mpv_liquid: { vert: 'mpv_liquid.vertex.shader', frag: 'mpv_liquid.fragment.shader' },
+	mpv_wmo: { vert: 'mpv_wmo.vertex.shader', frag: 'mpv_wmo.fragment.shader' },
+	mpv_sky: { vert: 'mpv_sky.vertex.shader', frag: 'mpv_sky.fragment.shader' }
 };
 
 // cached shader source text
@@ -24,6 +33,19 @@ const source_cache = new Map();
 // active shader programs grouped by shader name
 // Map<name, Set<ShaderProgram>>
 const active_programs = new Map();
+
+/**
+ * Process #include "filename" directives in shader source
+ * @param {string} source
+ * @param {string} shader_path
+ * @returns {string}
+ */
+function process_includes(source, shader_path) {
+	return source.replace(/^#include\s+"([^"]+)"\s*$/gm, (match, file) => {
+		const include_path = path.join(shader_path, file);
+		return fs.readFileSync(include_path, 'utf8');
+	});
+}
 
 /**
  * Load shader source from disk (cached)
@@ -39,8 +61,8 @@ function get_source(name) {
 		throw new Error(`Unknown shader: ${name}`);
 
 	const shader_path = constants.SHADER_PATH;
-	const vert = fs.readFileSync(path.join(shader_path, manifest.vert), 'utf8');
-	const frag = fs.readFileSync(path.join(shader_path, manifest.frag), 'utf8');
+	const vert = process_includes(fs.readFileSync(path.join(shader_path, manifest.vert), 'utf8'), shader_path);
+	const frag = process_includes(fs.readFileSync(path.join(shader_path, manifest.frag), 'utf8'), shader_path);
 
 	const sources = { vert, frag };
 	source_cache.set(name, sources);

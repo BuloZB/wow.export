@@ -219,12 +219,17 @@ const makeNewView = () => {
 		selectedZoneExpansionFilter: -1, // Currently selected zone expansion filter (-1 = show all)
 		mapViewerHasWorldModel: false, // Does selected map have a world model?
 		mapViewerIsWMOMinimap: false, // Is the map viewer showing a WMO minimap?
+		mapViewerGlobalWMO: null, // Global WMO data { file_data_id, placement }.
 		mapViewerTileLoader: null, // Tile loader for active map viewer map.
 		mapViewerSelectedMap: null, // Currently selected map.
 		mapViewerSelectedDir: null,
 		mapViewerChunkMask: null, // Map viewer chunk mask.
 		mapViewerGridSize: null, // Map viewer grid size (null = default 64).
 		mapViewerSelection: [], // Map viewer tile selection
+		mapViewerActive: false,
+		mapViewerMapDir: null,
+		mapViewerMapName: null,
+		mapViewerMapId: null,
 		selectedExpansionFilter: -1, // Currently selected expansion filter (-1 = show all)
 		chrModelViewerContext: null, // 3D context for the character-specific model viewer.
 		chrModelViewerAnims: [], // Available character animations.
@@ -298,6 +303,7 @@ const makeNewView = () => {
 		menuButtonMapExport: [
 			{ label: 'Export OBJ', value: 'OBJ' },
 			{ label: 'Export PNG', value: 'PNG' },
+			{ label: 'Export Minimap Tiles', value: 'MINIMAP' },
 			{ label: 'Export Raw', value: 'RAW' },
 			{ label: 'Export Heightmaps', value: 'HEIGHTMAPS' }
 		],
@@ -305,6 +311,7 @@ const makeNewView = () => {
 			{ label: 'Alpha Maps', value: -1 },
 			{ label: 'None', value: 0 },
 			{ label: 'Minimap (512)', value: 512 },
+			{ label: 'ADT LoD (1k)', value: -2 },
 			{ label: 'Low (1k)', value: 1024 },
 			{ label: 'Medium (4k)', value: 4096 },
 			{ label: 'High (8k)', value: 8192 },

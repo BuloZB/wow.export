@@ -203,8 +203,8 @@ class BLPImage {
 
 		// Calculate the scaled dimensions..
 		this.scale = Math.pow(2, mipmap);
-		this.scaledWidth = this.width / this.scale;
-		this.scaledHeight = this.height / this.scale;
+		this.scaledWidth = Math.max(1, Math.floor(this.width / this.scale));
+		this.scaledHeight = Math.max(1, Math.floor(this.height / this.scale));
 		this.scaledLength = this.scaledWidth * this.scaledHeight;
 
 		// Extract the raw data we need..
@@ -258,6 +258,23 @@ class BLPImage {
 	getRawMipmap(mipmap = 0) {
 		this._prepare(mipmap);
 		return Buffer.from(this.rawData);
+	}
+
+	/**
+	 * Get all raw mipmap levels for GPU compressed upload.
+	 * @returns {Array<{data: Uint8Array, width: number, height: number}>}
+	 */
+	get_raw_mipmaps() {
+		const mipmaps = [];
+		for (let i = 0; i < this.mapCount; i++) {
+			this._prepare(i);
+			mipmaps.push({
+				data: new Uint8Array(this.rawData),
+				width: this.scaledWidth,
+				height: this.scaledHeight
+			});
+		}
+		return mipmaps;
 	}
 
 	/**

@@ -23,6 +23,7 @@ const MAP_OFFSET = constants.GAME.MAP_OFFSET;
 
 let selected_map_id = null;
 let selected_map_dir = null;
+let selected_map_name = null;
 let selected_wdt = null;
 let game_objects_db2 = null;
 let wmo_minimap_textures = null;
@@ -306,6 +307,7 @@ module.exports = {
 			<div class="spaced-preview-controls">
 				<input v-if="$core.view.mapViewerHasWorldModel" type="button" value="Export Global WMO" @click="export_map_wmo" :class="{ disabled: $core.view.isBusy }"/>
 				<input v-if="$core.view.mapViewerHasWorldModel" type="button" value="Export WMO Minimap" @click="export_map_wmo_minimap" :class="{ disabled: $core.view.isBusy }"/>
+				<input type="button" value="Open in Map Viewer (3D)" @click="view_map" :disabled="$core.view.isBusy || !$core.view.mapViewerSelectedDir"/>
 				<component v-if="!$core.view.mapViewerIsWMOMinimap" :is="$components.MenuButton" :options="$core.view.menuButtonMapExport" :default="$core.view.config.exportMapFormat" @change="$core.view.config.exportMapFormat = $event" :disabled="$core.view.isBusy || $core.view.mapViewerSelection.length === 0" @click="export_map"></component>
 			</div>
 
@@ -364,6 +366,13 @@ module.exports = {
 	`,
 
 	methods: {
+		view_map() {
+			this.$core.view.mapViewerMapDir = selected_map_dir;
+			this.$core.view.mapViewerMapName = selected_map_name;
+			this.$core.view.mapViewerMapId = selected_map_id;
+			this.$core.view.mapViewerActive = true;
+		},
+
 		handle_map_context(data) {
 			this.$core.view.contextMenus.nodeMap = {
 				selection: data.selection,
@@ -412,18 +421,20 @@ module.exports = {
 			nw.Shell.openItem(dir);
 		},
 
-		async load_map(mapID, mapDir) {
+		async load_map(mapID, mapDir, mapName) {
 			const map_dir_lower = mapDir.toLowerCase();
 
 			this.$core.hideToast();
 
 			selected_map_id = mapID;
 			selected_map_dir = map_dir_lower;
+			selected_map_name = mapName ?? null;
 
 			selected_wdt = null;
 			current_wmo_minimap = null;
 			this.$core.view.mapViewerHasWorldModel = false;
 			this.$core.view.mapViewerIsWMOMinimap = false;
+			this.$core.view.mapViewerGlobalWMO = null;
 			this.$core.view.mapViewerGridSize = null;
 			this.$core.view.mapViewerSelection.splice(0);
 
@@ -442,6 +453,17 @@ module.exports = {
 				const has_global_wmo = wdt.worldModelPlacement !== undefined;
 
 				if (!has_terrain && has_global_wmo) {
+					// resolve global WMO file data ID for map viewer
+					const placement = wdt.worldModelPlacement;
+					let gwmo_id = 0;
+					if (wdt.worldModel)
+						gwmo_id = listfile.getByFilename(wdt.worldModel);
+					if (!gwmo_id)
+						gwmo_id = placement.id;
+
+					if (gwmo_id)
+						this.$core.view.mapViewerGlobalWMO = { file_data_id: gwmo_id, placement };
+
 					// try to load WMO minimap
 					await this.setup_wmo_minimap(wdt);
 
@@ -770,6 +792,8 @@ module.exports = {
 				await this.export_selected_map_as_png();
 			else if (format === 'RAW')
 				await this.export_selected_map_as_raw();
+			else if (format === 'MINIMAP')
+				await this.export_selected_minimap_tiles();
 			else if (format === 'HEIGHTMAPS')
 				await this.export_selected_map_as_heightmaps();
 		},
@@ -932,6 +956,49 @@ module.exports = {
 				log.write('PNG export failed: %s', e.message);
 			}
 
+			helper.finish();
+		},
+
+		async export_selected_minimap_tiles() {
+			const export_tiles = this.$core.view.mapViewerSelection;
+
+			if (export_tiles.length === 0)
+				return this.$core.setToast('error', 'You haven\'t selected any tiles; hold shift and click on a map tile to select it.', null, -1);
+
+			const helper = new ExportHelper(export_tiles.length, 'tile');
+			helper.start();
+
+			const dir = ExportHelper.getExportPath(path.join('maps', selected_map_dir, 'minimap'));
+			const export_paths = this.$core.openLastExportStream();
+
+			for (const index of export_tiles) {
+				if (helper.isCancelled())
+					break;
+
+				const x = Math.floor(index / constants.GAME.MAP_SIZE);
+				const y = index % constants.GAME.MAP_SIZE;
+				const tile_name = util.format('map%s_%s', x.toString().padStart(2, '0'), y.toString().padStart(2, '0'));
+				const mark_path = path.join('maps', selected_map_dir, 'minimap', tile_name);
+
+				try {
+					const tile_data = await load_map_tile(x, y, 512);
+					if (!tile_data)
+						throw new Error('minimap tile not available');
+
+					const png = new PNGWriter(tile_data.width, tile_data.height);
+					png.getPixelData().set(tile_data.data);
+
+					const out_path = path.join(dir, tile_name + '.png');
+					await png.write(out_path);
+
+					await export_paths?.writeLine('png:' + out_path);
+					helper.mark(mark_path, true);
+				} catch (e) {
+					helper.mark(mark_path, false, e.message, e.stack);
+				}
+			}
+
+			export_paths?.close();
 			helper.finish();
 		},
 
@@ -1138,7 +1205,7 @@ module.exports = {
 			if (!this.$core.view.isBusy && first) {
 				const map = parse_map_entry(first);
 				if (selected_map_id !== map.id)
-					this.load_map(map.id, map.dir);
+					this.load_map(map.id, map.dir, map.name);
 			}
 		});
 

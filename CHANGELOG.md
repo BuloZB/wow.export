@@ -1,3 +1,9 @@
+## 0.2.17 (09-05-2026)
+- Implemented a new map viewer tool for exploring maps in 3D directly in wow.export.
+- Implemented a new "ADT LoD" option for terrain exporting which uses the in-game LoD textures.
+- Implemented a new "Export Minimap Tiles" option to the map exporter.
+- Fixed a bug that prevented the correct WMO doodad sets from exporting on ADT exports.
+
 ## 0.2.16 (29-04-2026)
 - Fixed a regression causing terrain UV maps to be broken.
 - Fixed crash when loading Dracthyr characters (thanks Natnat).
