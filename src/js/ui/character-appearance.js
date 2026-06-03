@@ -6,6 +6,12 @@
 const CharMaterialRenderer = require('../3D/renderers/CharMaterialRenderer');
 const DBCharacterCustomization = require('../db/caches/DBCharacterCustomization');
 
+// m2 texture types built from the composited character skin; every other
+// replaceable type binds its raw source texture directly (matches
+// wowmodelviewer/webwowviewer, which only composite the body skin)
+const SKIN_TEXTURE_TYPE = 1;
+const SKIN_EXTRA_TEXTURE_TYPE = 8;
+
 /**
  * Reset geosets to model defaults, then apply customization choice geosets.
  * Does NOT apply equipment geosets — caller handles that.
@@ -197,9 +203,107 @@ function dispose_materials(chr_materials) {
 	chr_materials.clear();
 }
 
+/**
+ * Resolve active choices to raw customization texture files for non-skin
+ * replaceable texture types (e.g. DH blindfold = type 9). These are bound
+ * directly to skinned models rather than composited, since the composite
+ * pipeline is built for the multi-layer body skin and corrupts single-file
+ * replaceable textures relative to the model's own UVs.
+ * @param {Array} active_choices - array of { optionID, choiceID }
+ * @param {number} layout_id - CharComponentTextureLayoutID
+ * @returns {Map<number, number>} texture_type -> source FileDataID
+ */
+function resolve_replaceable_textures(active_choices, layout_id) {
+	const result = new Map();
+
+	for (const active_choice of active_choices) {
+		const chr_cust_mat_ids = DBCharacterCustomization.get_choice_materials(active_choice.choiceID);
+		if (chr_cust_mat_ids === undefined)
+			continue;
+
+		for (const chr_cust_mat_id of chr_cust_mat_ids) {
+			// honor related-choice gating (e.g. blindfold tint gated by eye color)
+			if (chr_cust_mat_id.RelatedChrCustomizationChoiceID != 0) {
+				const has_related_choice = active_choices.find((selected_choice) => selected_choice.choiceID === chr_cust_mat_id.RelatedChrCustomizationChoiceID);
+				if (!has_related_choice)
+					continue;
+			}
+
+			const chr_cust_mat = DBCharacterCustomization.get_chr_cust_material(chr_cust_mat_id.ChrCustomizationMaterialID);
+			if (!chr_cust_mat || !chr_cust_mat.FileDataID)
+				continue;
+
+			const chr_model_texture_layer = DBCharacterCustomization.get_model_texture_layer(layout_id, chr_cust_mat.ChrModelTextureTargetID);
+			if (chr_model_texture_layer === undefined)
+				continue;
+
+			// skin + skin-extra are composited elsewhere; only collect direct-bind types
+			if (chr_model_texture_layer.TextureType === SKIN_TEXTURE_TYPE || chr_model_texture_layer.TextureType === SKIN_EXTRA_TEXTURE_TYPE)
+				continue;
+
+			result.set(chr_model_texture_layer.TextureType, chr_cust_mat.FileDataID);
+		}
+	}
+
+	return result;
+}
+
+/**
+ * Determine whether a choice's skinned-model texture is gated by choices from
+ * other options (e.g. DH blindfold textures only for certain eye colors).
+ * @param {number} choice_id
+ * @param {number} layout_id - CharComponentTextureLayoutID
+ * @returns {{ has_ungated: boolean, gates: Map<number, Set<number>> }}
+ *   has_ungated: a direct-bind texture applies regardless of related choices
+ *   gates: option_id -> set of related choice ids that would supply the texture
+ */
+function get_texture_gating(choice_id, layout_id) {
+	const gates = new Map();
+	let has_ungated = false;
+
+	const chr_cust_mat_ids = DBCharacterCustomization.get_choice_materials(choice_id);
+	if (chr_cust_mat_ids === undefined)
+		return { has_ungated, gates };
+
+	for (const chr_cust_mat_id of chr_cust_mat_ids) {
+		const chr_cust_mat = DBCharacterCustomization.get_chr_cust_material(chr_cust_mat_id.ChrCustomizationMaterialID);
+		if (!chr_cust_mat || !chr_cust_mat.FileDataID)
+			continue;
+
+		const chr_model_texture_layer = DBCharacterCustomization.get_model_texture_layer(layout_id, chr_cust_mat.ChrModelTextureTargetID);
+		if (chr_model_texture_layer === undefined)
+			continue;
+
+		// only direct-bind (non-skin) types can leave a skinned model untextured
+		if (chr_model_texture_layer.TextureType === SKIN_TEXTURE_TYPE || chr_model_texture_layer.TextureType === SKIN_EXTRA_TEXTURE_TYPE)
+			continue;
+
+		if (chr_cust_mat_id.RelatedChrCustomizationChoiceID === 0) {
+			has_ungated = true;
+			continue;
+		}
+
+		const option_id = DBCharacterCustomization.get_choice_option(chr_cust_mat_id.RelatedChrCustomizationChoiceID);
+		if (option_id === undefined)
+			continue;
+
+		if (!gates.has(option_id))
+			gates.set(option_id, new Set());
+
+		gates.get(option_id).add(chr_cust_mat_id.RelatedChrCustomizationChoiceID);
+	}
+
+	return { has_ungated, gates };
+}
+
 module.exports = {
+	SKIN_TEXTURE_TYPE,
+	SKIN_EXTRA_TEXTURE_TYPE,
+
 	apply_customization_geosets,
 	apply_customization_textures,
 	upload_textures_to_gpu,
-	dispose_materials
+	dispose_materials,
+	resolve_replaceable_textures,
+	get_texture_gating
 };

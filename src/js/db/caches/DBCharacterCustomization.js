@@ -15,6 +15,7 @@ const unsupported_choices = new Array();
 
 const options_by_chr_model = new Map();
 const option_to_choices = new Map();
+const choice_to_option = new Map();
 const default_options = new Array();
 
 const chr_model_id_to_file_data_id = new Map();
@@ -70,7 +71,13 @@ const _initialize = async () => {
 			choice_to_geoset.set(chr_customization_element_row.ChrCustomizationChoiceID, chr_customization_element_row.ChrCustomizationGeosetID);
 
 		if (chr_customization_element_row.ChrCustomizationSkinnedModelID != 0) {
-			choice_to_skinned_model.set(chr_customization_element_row.ChrCustomizationChoiceID, chr_customization_element_row.ChrCustomizationSkinnedModelID);
+			// a single choice may carry multiple skinned-model elements (e.g.
+			// mechagnome legs reference two geoset groups), so accumulate them
+			if (choice_to_skinned_model.has(chr_customization_element_row.ChrCustomizationChoiceID))
+				choice_to_skinned_model.get(chr_customization_element_row.ChrCustomizationChoiceID).push(chr_customization_element_row.ChrCustomizationSkinnedModelID);
+			else
+				choice_to_skinned_model.set(chr_customization_element_row.ChrCustomizationChoiceID, [chr_customization_element_row.ChrCustomizationSkinnedModelID]);
+
 			unsupported_choices.push(chr_customization_element_row.ChrCustomizationChoiceID);
 		}
 
@@ -121,6 +128,7 @@ const _initialize = async () => {
 			choices_by_option.set(option_id, []);
 
 		choices_by_option.get(option_id).push([chr_customization_choice_id, chr_customization_choice_row]);
+		choice_to_option.set(chr_customization_choice_id, option_id);
 	}
 
 	// ChrModel -> FileDataID, texture layout, options, choices
@@ -227,6 +235,7 @@ const get_model_file_data_id = (model_id) => chr_model_id_to_file_data_id.get(mo
 const get_texture_layout_id = (model_id) => chr_model_id_to_texture_layout_id.get(model_id);
 const get_options_for_model = (model_id) => options_by_chr_model.get(model_id);
 const get_choices_for_option = (option_id) => option_to_choices.get(option_id);
+const get_choice_option = (choice_id) => choice_to_option.get(choice_id);
 const get_default_options = () => default_options;
 const get_option_to_choices_map = () => option_to_choices;
 
@@ -264,6 +273,25 @@ const get_texture_file_data_id = (material_resources_id) => tfd_map.get(material
 
 const get_choice_skinned_model = (choice_id) => choice_to_skinned_model.get(choice_id);
 const get_skinned_model = (id) => chr_cust_skinned_model_map.get(id);
+
+// resolve a choice to its external collection model(s) + geoset(s)
+// (submeshID = type*100+id); a choice may map to multiple skinned models
+const get_skinned_model_for_choice = (choice_id) => {
+	const skinned_model_ids = choice_to_skinned_model.get(choice_id);
+	if (skinned_model_ids === undefined)
+		return undefined;
+
+	const result = [];
+	for (const skinned_model_id of skinned_model_ids) {
+		const row = chr_cust_skinned_model_map.get(skinned_model_id);
+		if (row === undefined)
+			continue;
+
+		result.push({ FileDataID: row.CollectionsFileDataID, geoset: (row.GeosetType * 100) + row.GeosetID, geoset_group: row.GeosetType });
+	}
+
+	return result.length > 0 ? result : undefined;
+};
 const get_choice_cond_model_file_data_id = (choice_id) => choice_to_cond_file_data_id.get(choice_id);
 
 module.exports = {
@@ -273,6 +301,7 @@ module.exports = {
 	get_texture_layout_id,
 	get_options_for_model,
 	get_choices_for_option,
+	get_choice_option,
 	get_default_options,
 	get_option_to_choices_map,
 
@@ -296,5 +325,6 @@ module.exports = {
 	get_texture_file_data_id,
 	get_choice_skinned_model,
 	get_skinned_model,
+	get_skinned_model_for_choice,
 	get_choice_cond_model_file_data_id
 };

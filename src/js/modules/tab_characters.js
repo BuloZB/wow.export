@@ -105,8 +105,9 @@ let gl_context = null;
 let active_renderer;
 let active_model;
 
+// external customization models (file_data_id -> { renderer, geosets })
+// e.g. demon hunter horns, dracthyr, mechagnome limb upgrades
 const skinned_model_renderers = new Map();
-const skinned_model_meshes = new Set();
 
 const chr_materials = new Map();
 
@@ -121,6 +122,7 @@ let current_char_component_texture_layout_id = 0;
 let default_model_file_data_id = 0;
 let watcher_cleanup_funcs = [];
 let is_importing = false;
+let auto_select_in_progress = false;
 
 // thumbnail camera presets by race_id, then gender (0=male, 1=female)
 // format: [cam_x, cam_y, cam_z, tgt_x, tgt_y, tgt_z, rot]
@@ -253,8 +255,7 @@ const THUMBNAIL_PRESETS = {
 
 function reset_module_state() {
 	active_skins.clear();
-	skinned_model_renderers.clear();
-	skinned_model_meshes.clear();
+	dispose_skinned_models();
 	clear_materials();
 	dispose_equipment_models();
 	dispose_collection_models();
@@ -286,6 +287,7 @@ async function refresh_character_appearance(core) {
 
 	update_geosets(core);
 	await update_textures(core);
+	await update_skinned_models(core);
 	await update_equipment_models(core);
 
 	log.write('Character appearance refresh complete');
@@ -326,6 +328,11 @@ function update_geosets(core) {
 
 	// steps 1+2: reset to defaults and apply customization geosets
 	character_appearance.apply_customization_geosets(geosets, core.view.chrCustActiveChoices);
+
+	// step 2.5: hide base-model geosets for groups supplied by skinned models
+	// (e.g. mechagnome arms/legs live in both the base model and the collection
+	// model; without this the base limb renders alongside the upgrade -> dupes)
+	hide_skinned_model_base_geosets(core, geosets);
 
 	// step 3: apply equipment geosets (overrides customization where applicable)
 	const equipped_items = core.view.chrEquippedItems;
@@ -379,6 +386,33 @@ function update_geosets(core) {
 
 	// step 4: sync to renderer
 	active_renderer.updateGeosets();
+}
+
+/**
+ * Hide base-model geosets in any geoset group that an active skinned (collection)
+ * model supplies, so the upgrade geometry replaces the default limb instead of
+ * stacking on top of it.
+ */
+function hide_skinned_model_base_geosets(core, geosets) {
+	const covered_groups = new Set();
+	for (const active_choice of core.view.chrCustActiveChoices) {
+		const skinned_models = DBCharacterCustomization.get_skinned_model_for_choice(active_choice.choiceID);
+		if (skinned_models === undefined)
+			continue;
+
+		for (const skinned of skinned_models)
+			covered_groups.add(skinned.geoset_group);
+	}
+
+	for (const group of covered_groups) {
+		const range_start = group * 100 + 1;
+		const range_end = group * 100 + 99;
+
+		for (const geoset of geosets) {
+			if (geoset.id >= range_start && geoset.id <= range_end)
+				geoset.checked = false;
+		}
+	}
 }
 
 /**
@@ -450,7 +484,8 @@ async function update_textures(core) {
 					continue;
 
 				const modifier_id = item_skins?.[slot_id];
-				const item_textures = DBItemCharTextures.getItemTextures(item_id, char_info?.raceID, char_info?.genderIndex, modifier_id);
+				const class_id = core.view.config.chrIsDemonHunter ? 12 : 0;
+				const item_textures = DBItemCharTextures.getItemTextures(item_id, char_info?.raceID, char_info?.genderIndex, modifier_id, class_id);
 				if (!item_textures)
 					continue;
 
@@ -462,6 +497,11 @@ async function update_textures(core) {
 					const layer = layers_by_section.get(texture.section);
 					if (!layer)
 						continue;
+
+					// item textures overlay the skin; none/blit straight-copy would
+					// erase the body where the texture is transparent (e.g. sleeves),
+					// so force alpha compositing for those layers
+					const item_layer = (layer.BlendMode === 0 || layer.BlendMode === 1) ? { ...layer, BlendMode: 15 } : layer;
 
 					const chr_model_material = DBCharacterCustomization.get_model_material(current_char_component_texture_layout_id, layer.TextureType);
 					if (!chr_model_material)
@@ -482,7 +522,7 @@ async function update_textures(core) {
 						FileDataID: texture.fileDataID
 					};
 
-					await chr_material.setTextureTarget(item_material, section, chr_model_material, layer, true);
+					await chr_material.setTextureTarget(item_material, section, chr_model_material, item_layer, true);
 				}
 			}
 
@@ -712,6 +752,113 @@ async function update_equipment_models(core) {
 	}
 }
 
+/**
+ * Loads/updates external customization models (ChrCustomizationSkinnedModel).
+ * These share the character skeleton via bone remapping and consume the
+ * character's composite textures by texture type. Each active choice that maps
+ * to a skinned model contributes one geoset (submeshID) within its collection M2.
+ * Must run after update_textures so chr_materials are current.
+ */
+async function update_skinned_models(core) {
+	if (!gl_context || !active_renderer)
+		return;
+
+	// resolve active choices -> file_data_id -> set of visible geosets
+	// (a choice may contribute multiple skinned models / geoset groups)
+	const needed = new Map();
+	for (const active_choice of core.view.chrCustActiveChoices) {
+		const skinned_models = DBCharacterCustomization.get_skinned_model_for_choice(active_choice.choiceID);
+		if (skinned_models === undefined)
+			continue;
+
+		for (const skinned of skinned_models) {
+			if (!needed.has(skinned.FileDataID))
+				needed.set(skinned.FileDataID, new Set());
+
+			needed.get(skinned.FileDataID).add(skinned.geoset);
+		}
+	}
+
+	// dispose collection models no longer referenced
+	for (const file_data_id of skinned_model_renderers.keys()) {
+		if (!needed.has(file_data_id)) {
+			skinned_model_renderers.get(file_data_id).renderer.dispose();
+			skinned_model_renderers.delete(file_data_id);
+			log.write('Disposed skinned model %d', file_data_id);
+		}
+	}
+
+	// raw textures for non-skin replaceable types (e.g. blindfold = type 9)
+	const replaceable_textures = character_appearance.resolve_replaceable_textures(core.view.chrCustActiveChoices, current_char_component_texture_layout_id);
+
+	// load/update referenced collection models
+	for (const [file_data_id, geosets] of needed) {
+		let entry = skinned_model_renderers.get(file_data_id);
+
+		if (!entry) {
+			try {
+				const file = await core.view.casc.getFile(file_data_id);
+				const renderer = new M2RendererGL(file, gl_context, false, false);
+				await renderer.load();
+
+				if (active_renderer?.bones)
+					renderer.buildBoneRemapTable(active_renderer.bones);
+
+				entry = { renderer, geosets: null };
+				skinned_model_renderers.set(file_data_id, entry);
+				log.write('Loaded skinned model %d', file_data_id);
+			} catch (e) {
+				log.write('Failed to load skinned model %d: %s', file_data_id, e.message);
+				continue;
+			}
+		}
+
+		// bind textures: skin types use the composite body skin, all other
+		// replaceable types bind their raw source (embedded type-0 already loaded)
+		await apply_skinned_model_textures(entry.renderer, replaceable_textures);
+
+		apply_skinned_model_geosets(entry.renderer, geosets);
+		entry.geosets = geosets;
+	}
+}
+
+async function apply_skinned_model_textures(renderer, replaceable_textures) {
+	const needed_types = new Set(renderer.m2?.textureTypes || []);
+
+	for (const texture_type of needed_types) {
+		// embedded type-0 textures are loaded during renderer.load()
+		if (texture_type === 0)
+			continue;
+
+		// skin + skin-extra bind their matching composite (e.g. mechagnome
+		// metal is composited into skin-extra/type 8); fall back to the body
+		// skin only when the model lacks a dedicated composite for this type
+		if (texture_type === character_appearance.SKIN_TEXTURE_TYPE || texture_type === character_appearance.SKIN_EXTRA_TEXTURE_TYPE) {
+			const composite = chr_materials.get(texture_type) || chr_materials.get(character_appearance.SKIN_TEXTURE_TYPE);
+			if (composite)
+				await renderer.overrideTextureTypeWithPixels(texture_type, composite.glCanvas.width, composite.glCanvas.height, composite.getRawPixels());
+
+			continue;
+		}
+
+		// all other replaceable types bind the raw source texture directly
+		const file_data_id = replaceable_textures.get(texture_type);
+		if (file_data_id !== undefined)
+			await renderer.overrideTextureType(texture_type, file_data_id);
+	}
+}
+
+function apply_skinned_model_geosets(renderer, geosets) {
+	const skin = renderer.m2?.skins?.[0];
+	if (!skin?.subMeshes || !renderer.draw_calls)
+		return;
+
+	for (let i = 0; i < renderer.draw_calls.length && i < skin.subMeshes.length; i++) {
+		const submesh_id = skin.subMeshes[i].submeshID;
+		renderer.draw_calls[i].visible = (submesh_id === 0) || geosets.has(submesh_id);
+	}
+}
+
 //endregion
 
 //region models
@@ -792,11 +939,10 @@ async function load_character_model(core, file_data_id) {
 }
 
 function dispose_skinned_models() {
-	for (const [file_data_id, skinned_model_renderer] of skinned_model_renderers)
-		skinned_model_renderer.dispose();
+	for (const entry of skinned_model_renderers.values())
+		entry.renderer.dispose();
 
 	skinned_model_renderers.clear();
-	skinned_model_meshes.clear();
 }
 
 function dispose_equipment_models() {
@@ -960,6 +1106,46 @@ function update_choice_for_option(core, option_id, choice_id) {
 		existing_choice.choiceID = choice_id;
 	} else {
 		state.chrCustActiveChoices.push({ optionID: option_id, choiceID: choice_id });
+	}
+
+	auto_select_texture_gating(core, choice_id);
+}
+
+/**
+ * When a choice drives a skinned model whose texture is gated by another option
+ * (e.g. DH blindfold needs a DH eye color), switch that option to a compatible
+ * value so the model isn't shown untextured. The user can still pick any value
+ * afterwards; this only nudges the default on enable.
+ */
+function auto_select_texture_gating(core, choice_id) {
+	if (auto_select_in_progress)
+		return;
+
+	// only relevant for choices that drive a skinned model
+	if (DBCharacterCustomization.get_skinned_model_for_choice(choice_id) === undefined)
+		return;
+
+	const { has_ungated, gates } = character_appearance.get_texture_gating(choice_id, current_char_component_texture_layout_id);
+	if (has_ungated || gates.size === 0)
+		return;
+
+	const state = core.view;
+
+	auto_select_in_progress = true;
+	try {
+		for (const [gating_option_id, compatible] of gates) {
+			// skip options not present on this model
+			if (!DBCharacterCustomization.get_choices_for_option(gating_option_id))
+				continue;
+
+			const active = state.chrCustActiveChoices.find((c) => c.optionID === gating_option_id);
+			if (active && compatible.has(active.choiceID))
+				continue;
+
+			update_choice_for_option(core, gating_option_id, compatible.values().next().value);
+		}
+	} finally {
+		auto_select_in_progress = false;
 	}
 }
 
@@ -1817,7 +2003,8 @@ const export_char_model = async (core) => {
 			const char_exporter = new CharacterExporter(
 				active_renderer,
 				equipment_model_renderers,
-				collection_model_renderers
+				collection_model_renderers,
+				skinned_model_renderers
 			);
 
 			if (char_exporter.has_equipment()) {
@@ -1873,7 +2060,8 @@ const export_char_model = async (core) => {
 			const char_exporter = new CharacterExporter(
 				active_renderer,
 				equipment_model_renderers,
-				collection_model_renderers
+				collection_model_renderers,
+				skinned_model_renderers
 			);
 
 			if (char_exporter.has_equipment()) {
@@ -2166,6 +2354,14 @@ module.exports = {
 							<option value="" disabled selected style="display:none;"></option>
 							<option value="true">Visible</option>
 							<option value="false">Hidden</option>
+						</select>
+					</label>
+					<label class="ui-select-label">
+						<span class="select-prefix"><span class="prefix-label">Class:</span> <span class="prefix-value">{{ $core.view.config.chrIsDemonHunter ? 'Demon Hunter' : 'Other' }}</span></span>
+						<select class="ui-select" :value="$core.view.config.chrIsDemonHunter" @change="$core.view.config.chrIsDemonHunter = $event.target.value === 'true'">
+							<option value="" disabled selected style="display:none;"></option>
+							<option value="false">Other</option>
+							<option value="true">Demon Hunter</option>
 						</select>
 					</label>
 					</template>
@@ -2770,7 +2966,8 @@ module.exports = {
 			fitCamera: null,
 			getActiveRenderer: () => active_renderer,
 			getEquipmentRenderers: () => equipment_model_renderers,
-			getCollectionRenderers: () => collection_model_renderers
+			getCollectionRenderers: () => collection_model_renderers,
+			getSkinnedRenderers: () => skinned_model_renderers
 		};
 
 		const ctx_watcher = state.$watch('chrModelViewerContext.gl_context', (new_ctx) => {
@@ -2783,6 +2980,7 @@ module.exports = {
 		// simplified watchers - no isBusy checks, proper async handling
 		watcher_cleanup_funcs.push(
 			this.$core.view.$watch('config.chrIncludeBaseClothing', () => refresh_character_appearance(this.$core)),
+			this.$core.view.$watch('config.chrIsDemonHunter', () => refresh_character_appearance(this.$core)),
 			this.$core.view.$watch('chrCustRaceSelection', () => update_chr_model_list(this.$core)),
 			this.$core.view.$watch('chrCustModelSelection', () => update_model_selection(this.$core), { deep: true }),
 			this.$core.view.$watch('chrCustOptionSelection', () => update_customization_type(this.$core), { deep: true }),
