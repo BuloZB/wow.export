@@ -17,7 +17,9 @@ const WMOExporter = require('../3D/exporters/WMOExporter');
 const WMOLoader = require('../3D/loaders/WMOLoader');
 const TiledPNGWriter = require('../tiled-png-writer');
 const PNGWriter = require('../png-writer');
+const JSONWriter = require('../3D/writers/JSONWriter');
 const wmo_minimap = require('../wmo-minimap');
+const journal_encounters = require('../journal-encounters');
 
 const TILE_SIZE = constants.GAME.TILE_SIZE;
 const MAP_OFFSET = constants.GAME.MAP_OFFSET;
@@ -284,7 +286,7 @@ module.exports = {
 				<div class="regex-info" v-if="$core.view.config.regexFilters" :title="$core.view.regexTooltip">Regex Enabled</div>
 				<input type="text" v-model="$core.view.userInputFilterMaps" placeholder="Filter maps..."/>
 			</div>
-			<component :is="$components.MapViewer" :map="$core.view.mapViewerSelectedMap" :loader="$core.view.mapViewerTileLoader" :tile-size="512" :zoom="12" :mask="$core.view.mapViewerChunkMask" :grid-size="$core.view.mapViewerGridSize" v-model:selection="$core.view.mapViewerSelection" :selectable="!$core.view.mapViewerIsWMOMinimap"></component>
+			<component :is="$components.MapViewer" :map="$core.view.mapViewerSelectedMap" :loader="$core.view.mapViewerTileLoader" :tile-size="512" :zoom="12" :mask="$core.view.mapViewerChunkMask" :grid-size="$core.view.mapViewerGridSize" v-model:selection="$core.view.mapViewerSelection" :selectable="!$core.view.mapViewerIsWMOMinimap" :markers="$core.view.config.mapViewerShowEncounters ? $core.view.mapViewerMarkers : []"></component>
 			<div class="spaced-preview-controls">
 				<input v-if="$core.view.mapViewerHasWorldModel" type="button" value="Export Global WMO" @click="export_map_wmo" :class="{ disabled: $core.view.isBusy }"/>
 				<input v-if="$core.view.mapViewerHasWorldModel" type="button" value="Export WMO Minimap" @click="export_map_wmo_minimap" :class="{ disabled: $core.view.isBusy }"/>
@@ -293,6 +295,11 @@ module.exports = {
 			</div>
 
 			<div id="maps-sidebar" class="sidebar">
+				<span class="header">Map Display</span>
+				<label class="ui-checkbox" title="Overlay red markers where dungeon/raid encounters take place">
+					<input type="checkbox" v-model="$core.view.config.mapViewerShowEncounters"/>
+					<span>Show Encounters</span>
+				</label>
 				<span class="header">Export Options</span>
 				<label class="ui-checkbox" title="Include WMO objects (large objects such as buildings)">
 					<input type="checkbox" v-model="$core.view.config.mapsIncludeWMO"/>
@@ -413,6 +420,7 @@ module.exports = {
 
 			selected_wdt = null;
 			current_wmo_minimap = null;
+			this.$core.view.mapViewerMarkers = [];
 			this.$core.view.mapViewerHasWorldModel = false;
 			this.$core.view.mapViewerIsWMOMinimap = false;
 			this.$core.view.mapViewerGlobalWMO = null;
@@ -455,6 +463,7 @@ module.exports = {
 						this.$core.view.mapViewerIsWMOMinimap = true;
 						this.$core.view.mapViewerSelectedMap = mapID;
 						this.$core.view.mapViewerSelectedDir = mapDir;
+						this.load_wmo_encounter_markers(mapID, current_wmo_minimap, placement);
 						this.$core.setToast('info', 'Showing WMO minimap. Use "Export Global WMO" to export the world model.', null, 6000);
 						return;
 					}
@@ -467,13 +476,32 @@ module.exports = {
 				this.$core.view.mapViewerChunkMask = wdt.tiles;
 				this.$core.view.mapViewerSelectedMap = mapID;
 				this.$core.view.mapViewerSelectedDir = mapDir;
+				this.load_encounter_markers(mapID);
 			} catch (e) {
 				log.write('cannot load %s, defaulting to all chunks enabled', wdt_path);
 				this.$core.view.mapViewerTileLoader = load_map_tile;
 				this.$core.view.mapViewerChunkMask = null;
 				this.$core.view.mapViewerSelectedMap = mapID;
 				this.$core.view.mapViewerSelectedDir = mapDir;
+				this.load_encounter_markers(mapID);
 			}
+		},
+
+		// resolve journal encounter markers for dungeon/raid maps, non-blocking
+		async load_encounter_markers(mapID) {
+			const markers = await journal_encounters.get_encounters_for_map(mapID);
+
+			// ignore if the user switched maps while resolving
+			if (this.$core.view.mapViewerSelectedMap === mapID)
+				this.$core.view.mapViewerMarkers = markers;
+		},
+
+		// resolve encounter markers projected onto a global WMO minimap, non-blocking
+		async load_wmo_encounter_markers(mapID, minimap_data, placement) {
+			const markers = await journal_encounters.get_wmo_encounters_for_map(mapID, minimap_data, placement);
+
+			if (this.$core.view.mapViewerSelectedMap === mapID)
+				this.$core.view.mapViewerMarkers = markers;
 		},
 
 		async setup_wmo_minimap(wdt) {
@@ -580,7 +608,7 @@ module.exports = {
 				const relative_path = path.join('maps', selected_map_dir, filename);
 				const out_path = ExportHelper.getExportPath(relative_path);
 
-				await wmo_minimap.export_minimap(minimap_data, this.$core.view.casc, out_path, helper);
+				await wmo_minimap.export_minimap(minimap_data, this.$core.view.casc, out_path, helper, selected_wdt.worldModelPlacement, selected_map_id, selected_map_name);
 
 				if (helper.isCancelled())
 					return;
@@ -757,6 +785,31 @@ module.exports = {
 
 				const stats = writer.getStats();
 				log.write('map export complete: %s (%d tiles)', out_path, stats.totalTiles);
+
+				// sidecar describing the stitched image's world-space placement. world_x =
+				// north, world_y = west (yards), matching the wmo minimap sidecar so a single
+				// loader handles both. image axes: horizontal = tileY (x), vertical = tileX (y);
+				// top-left is (min_x, min_y), bottom-right spans one tile past (max_x, max_y).
+				const meta = new JSONWriter(out_path.replace(/\.[^.\\/]+$/, '.json'));
+				meta.addProperty('map_id', selected_map_id);
+				meta.addProperty('map_dir', selected_map_dir);
+				meta.addProperty('map_name', selected_map_name);
+				meta.addProperty('tile_size', tile_size);
+				meta.addProperty('tiles', { min_x, max_x, min_y, max_y, wide: tiles_wide, high: tiles_high });
+				meta.addProperty('image', { width: final_width, height: final_height });
+				meta.addProperty('corners', {
+					top_left: {
+						world_x: (32 - min_y) * TILE_SIZE,
+						world_y: (32 - min_x) * TILE_SIZE,
+					},
+					bottom_right: {
+						world_x: (32 - (max_y + 1)) * TILE_SIZE,
+						world_y: (32 - (max_x + 1)) * TILE_SIZE,
+					},
+				});
+				meta.addProperty('modf', null);
+				await meta.write();
+				log.write('map export meta written: %s', meta.out);
 
 				const export_paths = this.$core.openLastExportStream();
 				await export_paths?.writeLine('png:' + out_path);
